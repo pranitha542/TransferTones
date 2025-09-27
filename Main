@@ -1,0 +1,160 @@
+import re
+import torch
+from transformers import MarianMTModel, MarianTokenizer
+from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
+
+# --- Languages ---
+language_dict = {
+    "english": "en", "spanish": "es", "french": "fr", "german": "de",
+    "italian": "it", "portuguese": "pt", "dutch": "nl", "russian": "ru",
+    "chinese": "zh", "japanese": "ja", "arabic": "ar", "hindi": "hi",
+    "bengali": "bn", "korean": "ko", "turkish": "tr", "polish": "pl"
+}
+
+# normalize user input (name or 2-letter code)
+def normalize_lang(inp):
+    if not inp:
+        return None
+    s = inp.strip().lower()
+    if s in language_dict.values():
+        return s
+    if s in language_dict:
+        return language_dict[s]
+    alt = {"zh-cn":"zh","zh_cn":"zh","zh-tw":"zh",
+           "ko-kr":"ko","ko_kr":"ko","en-us":"en"}
+    if s in alt:
+        return alt[s]
+    return None
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- Load best model for src->tgt ---
+def load_model(src_code, tgt_code):
+    # Force English -> Korean Marian model
+    if src_code == "en" and tgt_code == "ko":
+        mn = "Helsinki-NLP/opus-mt-tc-big-en-ko"
+        model = MarianMTModel.from_pretrained(mn)
+        tokenizer = MarianTokenizer.from_pretrained(mn)
+        model.to(DEVICE)
+        return model, tokenizer, "marian", mn
+
+    # Korean -> English Marian
+    if src_code == "ko" and tgt_code == "en":
+        mn = "Helsinki-NLP/opus-mt-ko-en"
+        model = MarianMTModel.from_pretrained(mn)
+        tokenizer = MarianTokenizer.from_pretrained(mn)
+        model.to(DEVICE)
+        return model, tokenizer, "marian", mn
+
+    # Other pairs: try direct Marian
+    mn = f"Helsinki-NLP/opus-mt-{src_code}-{tgt_code}"
+    try:
+        model = MarianMTModel.from_pretrained(mn)
+        tokenizer = MarianTokenizer.from_pretrained(mn)
+        model.to(DEVICE)
+        return model, tokenizer, "marian", mn
+    except Exception:
+        pass
+
+    # Fallback: M2M100
+    mname = "facebook/m2m100_418M"
+    model = M2M100ForConditionalGeneration.from_pretrained(mname)
+    tokenizer = M2M100Tokenizer.from_pretrained(mname)
+    model.to(DEVICE)
+    return model, tokenizer, "m2m100", mname
+
+# --- Token limit for chunking ---
+def get_token_limit(tokenizer):
+    try:
+        ml = int(tokenizer.model_max_length)
+        if ml <= 0 or ml > 65536:
+            ml = 1024
+    except Exception:
+        ml = 1024
+    return max(128, ml - 10)
+
+# --- Split long text into chunks ---
+def chunk_text(text, tokenizer, max_tokens):
+    pieces = re.split(r'(?<=[\.\?\!。！？\n])\s+', text)
+    chunks, cur = [], ""
+    for p in pieces:
+        if not p.strip():
+            continue
+        candidate = (cur + " " + p) if cur else p
+        tok_len = len(tokenizer.encode(candidate, add_special_tokens=False))
+        if tok_len <= max_tokens:
+            cur = candidate
+        else:
+            if cur:
+                chunks.append(cur)
+            if len(tokenizer.encode(p, add_special_tokens=False)) > max_tokens:
+                approx_chars = max(200, int(len(p) * max_tokens /
+                                max(1, len(tokenizer.encode(p, add_special_tokens=False)))))
+                for i in range(0, len(p), approx_chars):
+                    chunks.append(p[i:i+approx_chars])
+                cur = ""
+            else:
+                cur = p
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+# --- Translate one chunk ---
+def translate_chunk(model, tokenizer, mode, text, src_code, tgt_code, max_length=512, num_beams=5):
+    if mode == "marian":
+        inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=False).to(DEVICE)
+        out = model.generate(**inputs, max_length=max_length, num_beams=num_beams,
+                             early_stopping=True, no_repeat_ngram_size=3)
+        return tokenizer.batch_decode(out, skip_special_tokens=True)[0]
+    elif mode == "m2m100":
+        tokenizer.src_lang = src_code
+        inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=False).to(DEVICE)
+        forced_id = tokenizer.get_lang_id(tgt_code)
+        out = model.generate(**inputs, forced_bos_token_id=forced_id,
+                             max_length=max_length, num_beams=num_beams,
+                             no_repeat_ngram_size=3)
+        return tokenizer.batch_decode(out, skip_special_tokens=True)[0]
+    else:
+        raise ValueError("Unknown mode")
+
+# --- Main translator with context prepending ---
+def translate_long_text(text, src, tgt, num_beams=5):
+    src_code = normalize_lang(src)
+    tgt_code = normalize_lang(tgt)
+    if src_code is None or tgt_code is None:
+        raise ValueError("Unsupported language. Choose from: " +
+                         ", ".join(sorted(language_dict.keys())))
+
+    # Add context for very short English phrases -> Korean
+    if src_code == "en" and tgt_code == "ko":
+        if len(text.split()) <= 4:  # very short phrase
+            text = "I " + text  # e.g., "love you all" -> "I love you all"
+
+    model, tokenizer, mode, model_name = load_model(src_code, tgt_code)
+    token_limit = get_token_limit(tokenizer)
+    chunks = chunk_text(text, tokenizer, token_limit)
+
+    outputs = []
+    for ch in chunks:
+        out = translate_chunk(model, tokenizer, mode, ch,
+                              src_code, tgt_code,
+                              max_length=token_limit+50, num_beams=num_beams)
+        outputs.append(out)
+
+    result = "\n\n".join(o.strip() for o in outputs if o.strip())
+    return {"translated_text": result,
+            "model_used": model_name,
+            "mode": mode,
+            "chunks": len(chunks)}
+
+# --- Example usage ---
+if __name__ == "__main__":
+    src = input("Source language (name or code): ").strip()
+    tgt = input("Target language (name or code): ").strip()
+    text = input("Enter text to translate (paste long text as needed):\n")
+    res = translate_long_text(text, src, tgt, num_beams=5)
+
+    print("\n--- Model info ---")
+    print("Used:", res["model_used"], "mode:", res["mode"], "chunks:", res["chunks"])
+    print("\n--- Translation ---\n")
+    print(res["translated_text"])
